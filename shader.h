@@ -657,9 +657,11 @@ class two_level_rr_scheduler : public scheduler_unit {
     }
     return true;
   }
-
-  unsigned m_fetch_group_size;
+  
   unsigned m_current_fetch_group;
+  unsigned m_fetch_group_size;
+  //unsigned m_fetch_group_size;
+  //unsigned m_current_fetch_group;
 };
 
 
