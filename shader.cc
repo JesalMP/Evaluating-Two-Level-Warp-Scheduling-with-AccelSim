@@ -195,6 +195,12 @@ void shader_core_ctx::create_schedulers() {
 const concrete_scheduler scheduler =
       sched_config.find("two_level_rr") != std::string::npos
           ? CONCRETE_SCHEDULER_TWO_LEVEL_RR
+      : sched_config.find("lwm_two_level_adaptive") != std::string::npos
+          ? CONCRETE_SCHEDULER_LWM_TWO_LEVEL_ADAPTIVE
+      : sched_config.find("lwm_two_level") != std::string::npos
+          ? CONCRETE_SCHEDULER_LWM_TWO_LEVEL
+      : sched_config.find("lwm") != std::string::npos
+          ? CONCRETE_SCHEDULER_LWM
       : sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
       : sched_config.find("two_level_active") != std::string::npos
           ? CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE
@@ -274,6 +280,30 @@ const concrete_scheduler scheduler =
         break;
       case CONCRETE_SCHEDULER_TWO_LEVEL_RR:
         schedulers.push_back(new two_level_rr_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
+        break;
+      case CONCRETE_SCHEDULER_LWM:
+        schedulers.push_back(new lwm_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
+        break;
+      case CONCRETE_SCHEDULER_LWM_TWO_LEVEL_ADAPTIVE:
+        schedulers.push_back(new lwm_two_level_adaptive_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
+        break;
+      case CONCRETE_SCHEDULER_LWM_TWO_LEVEL:
+        schedulers.push_back(new lwm_two_level_scheduler(
             m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
             &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
             &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
@@ -1753,6 +1783,379 @@ void two_level_rr_scheduler::order_warps() {
     }
   }
 }
+void lwm_scheduler::order_warps() {
+  unsigned num_warps = m_supervised_warps.size();
+  if (num_warps == 0) return;
+
+  unsigned num_large_warps =
+      (num_warps + m_warps_per_large_warp - 1) / m_warps_per_large_warp;
+
+  // Switch to next large warp if current one is all stalled
+  if (large_warp_all_stalled(m_current_large_warp)) {
+    for (unsigned i = 1; i <= num_large_warps; i++) {
+      unsigned candidate = (m_current_large_warp + i) % num_large_warps;
+      if (!large_warp_all_stalled(candidate)) {
+        m_current_large_warp = candidate;
+        break;
+      }
+    }
+  }
+
+  // Build prioritized warp list:
+  // Key idea of LWM: prioritize warps within the current large warp
+  // that have the most active threads, to maximize SIMD utilization
+  m_next_cycle_prioritized_warps.clear();
+
+  // First add warps from current large warp, sorted by active thread count
+  unsigned start = m_current_large_warp * m_warps_per_large_warp;
+  unsigned end = std::min(num_warps, start + m_warps_per_large_warp);
+
+  // Collect warps in current large warp
+  std::vector<shd_warp_t *> current_large_warp_warps(
+      m_supervised_warps.begin() + start,
+      m_supervised_warps.begin() + end);
+
+  // Sort by number of active threads in the next instruction (descending).
+  // Use the pre-recorded active mask from the trace (ibuffer) — this reflects
+  // real branch divergence. Stalled warps get 0; warps with empty ibuffers
+  // (not yet fetched but not stalled) get MAX_WARP_SIZE so they aren't skipped.
+  auto lwm_active_count = [](shd_warp_t *w) -> unsigned {
+    if (w->done_exit() || w->waiting()) return 0;
+    if (w->ibuffer_next_valid() && w->ibuffer_next_inst())
+      return w->ibuffer_next_inst()->active_count();
+    return MAX_WARP_SIZE;  // not stalled, ibuffer not yet filled — treat as full
+  };
+  std::sort(current_large_warp_warps.begin(), current_large_warp_warps.end(),
+            [&lwm_active_count](shd_warp_t *a, shd_warp_t *b) {
+              return lwm_active_count(a) > lwm_active_count(b);
+            });
+
+  for (auto *w : current_large_warp_warps) {
+    m_next_cycle_prioritized_warps.push_back(w);
+  }
+
+  // Then append remaining large warps in round-robin order
+  for (unsigned g = 1; g < num_large_warps; g++) {
+    unsigned group_id = (m_current_large_warp + g) % num_large_warps;
+    unsigned s = group_id * m_warps_per_large_warp;
+    unsigned e = std::min(num_warps, s + m_warps_per_large_warp);
+
+    std::vector<shd_warp_t *> group_warps(
+        m_supervised_warps.begin() + s,
+        m_supervised_warps.begin() + e);
+
+    std::vector<shd_warp_t *> ordered_group;
+    order_lrr(ordered_group, group_warps,
+              group_warps.end(),
+              group_warps.size());
+
+    for (auto *w : ordered_group) {
+      m_next_cycle_prioritized_warps.push_back(w);
+    }
+  }
+}
+
+void lwm_two_level_scheduler::order_warps() {
+  unsigned num_warps = m_supervised_warps.size();
+  if (num_warps == 0) return;
+
+  unsigned num_groups =
+      (num_warps + m_warps_per_group - 1) / m_warps_per_group;
+
+  // Active-count helper: use ibuffer trace mask, fall back gracefully.
+  // Defined early because both levels (group selection and warp ordering) use it.
+  auto lwm_active_count = [](shd_warp_t *w) -> unsigned {
+    if (w->done_exit() || w->waiting()) return 0;
+    if (w->ibuffer_next_valid() && w->ibuffer_next_inst())
+      return w->ibuffer_next_inst()->active_count();
+    return MAX_WARP_SIZE;
+  };
+
+  // Helper: sum active thread counts across all warps in a group.
+  auto group_active_sum = [&](unsigned group_id) -> unsigned {
+    unsigned s = group_id * m_warps_per_group;
+    unsigned e = std::min(num_warps, s + m_warps_per_group);
+    unsigned sum = 0;
+    for (unsigned i = s; i < e; i++) sum += lwm_active_count(m_supervised_warps[i]);
+    return sum;
+  };
+
+  // Outer level: when current group is all stalled, switch to the non-stalled
+  // group with the HIGHEST aggregate active thread count (LWM-aware group
+  // selection).  This distinguishes lwm_two_level from lwm, which always picks
+  // the next non-stalled group in round-robin order.
+  if (group_all_stalled(m_current_fetch_group)) {
+    unsigned best_group = m_current_fetch_group;
+    unsigned best_sum = 0;
+    for (unsigned i = 1; i <= num_groups; i++) {
+      unsigned candidate = (m_current_fetch_group + i) % num_groups;
+      if (!group_all_stalled(candidate)) {
+        unsigned s = group_active_sum(candidate);
+        if (s > best_sum) {
+          best_sum = s;
+          best_group = candidate;
+        }
+      }
+    }
+    m_current_fetch_group = best_group;
+  }
+
+  m_next_cycle_prioritized_warps.clear();
+
+  // Inner level: current group sorted by active thread count (descending).
+  unsigned start = m_current_fetch_group * m_warps_per_group;
+  unsigned end = std::min(num_warps, start + m_warps_per_group);
+  std::vector<shd_warp_t *> cur_group(m_supervised_warps.begin() + start,
+                                      m_supervised_warps.begin() + end);
+  std::sort(cur_group.begin(), cur_group.end(),
+            [&lwm_active_count](shd_warp_t *a, shd_warp_t *b) {
+              return lwm_active_count(a) > lwm_active_count(b);
+            });
+  for (auto *w : cur_group) {
+    m_next_cycle_prioritized_warps.push_back(w);
+  }
+
+  // Remaining groups: append sorted by group active sum (best non-current group
+  // first), with round-robin within each group.
+  std::vector<unsigned> other_group_ids;
+  for (unsigned g = 1; g < num_groups; g++) {
+    other_group_ids.push_back((m_current_fetch_group + g) % num_groups);
+  }
+  std::sort(other_group_ids.begin(), other_group_ids.end(),
+            [&group_active_sum](unsigned a, unsigned b) {
+              return group_active_sum(a) > group_active_sum(b);
+            });
+  for (unsigned group_id : other_group_ids) {
+    unsigned s = group_id * m_warps_per_group;
+    unsigned e = std::min(num_warps, s + m_warps_per_group);
+    std::vector<shd_warp_t *> other_group(m_supervised_warps.begin() + s,
+                                          m_supervised_warps.begin() + e);
+    std::vector<shd_warp_t *> ordered;
+    order_lrr(ordered, other_group, other_group.end(), other_group.size());
+    for (auto *w : ordered) {
+      m_next_cycle_prioritized_warps.push_back(w);
+    }
+  }
+}
+
+void lwm_two_level_adaptive_scheduler::order_warps() {
+  unsigned num_warps = m_supervised_warps.size();
+  if (num_warps == 0) return;
+
+  unsigned num_groups =
+      (num_warps + m_warps_per_group - 1) / m_warps_per_group;
+
+  // Active-count helper: use ibuffer trace mask, fall back gracefully
+  auto lwm_active_count = [](shd_warp_t *w) -> unsigned {
+    if (w->done_exit() || w->waiting()) return 0;
+    if (w->ibuffer_next_valid() && w->ibuffer_next_inst())
+      return w->ibuffer_next_inst()->active_count();
+    return MAX_WARP_SIZE;
+  };
+
+  // Outer-level trigger: switch when current group is fully stalled OR
+  // SIMD utilization drops below 50%.  Select the non-stalled group with
+  // the highest aggregate active count (LWM-aware group selection).
+  if (group_all_stalled(m_current_fetch_group) ||
+      group_underutilized(m_current_fetch_group)) {
+    unsigned best_group = m_current_fetch_group;
+    unsigned best_sum = group_active_sum(m_current_fetch_group);
+    for (unsigned i = 1; i <= num_groups; i++) {
+      unsigned candidate = (m_current_fetch_group + i) % num_groups;
+      if (!group_all_stalled(candidate)) {
+        unsigned s = group_active_sum(candidate);
+        if (s > best_sum) {
+          best_sum = s;
+          best_group = candidate;
+        }
+      }
+    }
+    m_current_fetch_group = best_group;
+  }
+
+  m_next_cycle_prioritized_warps.clear();
+
+  // Inner level — two-step ordering for current group:
+  //
+  // Step 1: order_lrr starting from m_last_supervised_issued within the group.
+  //   This gives a fair round-robin rotation — the same warp does not always
+  //   go first, so memory requests are evenly spread across the group.
+  //   This is what makes two_level_rr:8 beat plain sort-based schedulers on
+  //   regular non-divergent benchmarks (hotspot, pathfinder, streamcluster).
+  //
+  // Step 2: std::stable_sort by active thread count (descending).
+  //   stable_sort preserves the lrr rotation order for equal-key warps, so:
+  //   - Converged benchmarks (all active_count = MAX_WARP_SIZE): keys are all
+  //     equal → rotation preserved exactly → matches two_level_rr:8 behaviour.
+  //   - Divergent benchmarks: warps with more active threads bubble to front,
+  //     giving LWM's SIMD-utilization benefit while still rotating fairly
+  //     within each active-count tier.
+  unsigned start = m_current_fetch_group * m_warps_per_group;
+  unsigned end = std::min(num_warps, start + m_warps_per_group);
+  std::vector<shd_warp_t *> cur_group(m_supervised_warps.begin() + start,
+                                      m_supervised_warps.begin() + end);
+
+  // Find where m_last_supervised_issued falls inside cur_group (if at all)
+  std::vector<shd_warp_t *>::const_iterator last_in_cur = cur_group.end();
+  if (m_last_supervised_issued != m_supervised_warps.end()) {
+    for (auto it = cur_group.begin(); it != cur_group.end(); ++it) {
+      if (*it == *m_last_supervised_issued) {
+        last_in_cur = it;
+        break;
+      }
+    }
+  }
+
+  // Step 1: lrr rotation within current group
+  std::vector<shd_warp_t *> lrr_ordered;
+  order_lrr(lrr_ordered, cur_group, last_in_cur, cur_group.size());
+
+  // Step 2: stable sort by active count — ties keep lrr rotation intact
+  std::stable_sort(lrr_ordered.begin(), lrr_ordered.end(),
+                   [&lwm_active_count](shd_warp_t *a, shd_warp_t *b) {
+                     return lwm_active_count(a) > lwm_active_count(b);
+                   });
+
+  for (auto *w : lrr_ordered) {
+    m_next_cycle_prioritized_warps.push_back(w);
+  }
+
+  // Remaining groups: sorted by aggregate active sum (best group first),
+  // round-robin within each group.
+  std::vector<unsigned> other_group_ids;
+  for (unsigned g = 1; g < num_groups; g++)
+    other_group_ids.push_back((m_current_fetch_group + g) % num_groups);
+  std::sort(other_group_ids.begin(), other_group_ids.end(),
+            [this](unsigned a, unsigned b) {
+              return group_active_sum(a) > group_active_sum(b);
+            });
+  for (unsigned group_id : other_group_ids) {
+    unsigned s = group_id * m_warps_per_group;
+    unsigned e = std::min(num_warps, s + m_warps_per_group);
+    std::vector<shd_warp_t *> other_group(m_supervised_warps.begin() + s,
+                                          m_supervised_warps.begin() + e);
+    std::vector<shd_warp_t *> ordered;
+    order_lrr(ordered, other_group, other_group.end(), other_group.size());
+    for (auto *w : ordered) {
+      m_next_cycle_prioritized_warps.push_back(w);
+    }
+  }
+}
+
+/*void lwm_scheduler::cycle() {
+  // First assign large warp IDs to supervised warps
+  for (unsigned i = 0; i < m_supervised_warps.size(); i++) {
+    m_supervised_warps[i]->m_large_warp_id = i / m_warps_per_large_warp;
+    m_supervised_warps[i]->m_in_large_warp = true;
+  }
+
+  bool valid_inst = false;
+  bool ready_inst = false;
+  bool issued_inst = false;
+
+  order_warps();
+
+  for (std::vector<shd_warp_t *>::const_iterator iter =
+           m_next_cycle_prioritized_warps.begin();
+       iter != m_next_cycle_prioritized_warps.end(); iter++) {
+
+    if ((*iter) == NULL || (*iter)->done_exit()) continue;
+
+    unsigned warp_id = (*iter)->get_warp_id();
+    unsigned large_warp_id = (*iter)->m_large_warp_id;
+
+    if (warp(warp_id).ibuffer_empty()) continue;
+    if (warp(warp_id).waiting()) continue;
+
+    const warp_inst_t *pI = warp(warp_id).ibuffer_next_inst();
+    if (!pI) continue;
+
+    valid_inst = true;
+
+    if (m_scoreboard->checkCollision(warp_id, pI)) continue;
+
+    ready_inst = true;
+
+    // Get base active mask for this warp
+    const active_mask_t &base_mask = m_shader->get_active_mask(warp_id, pI);
+    
+    // Build combined sub-warp mask by collecting active threads
+    // from other warps in the same large warp group at the same PC
+    active_mask_t combined_mask = base_mask;
+    unsigned combined_count = base_mask.count();
+
+    // Only try to combine if base mask is not full
+    if (combined_count < MAX_WARP_SIZE) {
+      unsigned start = large_warp_id * m_warps_per_large_warp;
+      unsigned end = std::min((unsigned)m_supervised_warps.size(),
+                              start + m_warps_per_large_warp);
+
+      for (unsigned i = start; i < end && combined_count < MAX_WARP_SIZE; i++) {
+        shd_warp_t *other = m_supervised_warps[i];
+        unsigned other_id = other->get_warp_id();
+
+        // Skip the current warp
+        if (other_id == warp_id) continue;
+        if (other->done_exit() || other->waiting()) continue;
+        if (other->ibuffer_empty()) continue;
+
+        // Only merge if at same PC
+        if (other->get_pc() != warp(warp_id).get_pc()) continue;
+
+        const warp_inst_t *pI_other = other->ibuffer_next_inst();
+        if (!pI_other) continue;
+        if (m_scoreboard->checkCollision(other_id, pI_other)) continue;
+
+        // Get other warp's active mask
+        const active_mask_t &other_mask =
+            m_shader->get_active_mask(other_id, pI_other);
+
+        // Add threads from other warp that fit in empty lanes
+        // Remap other warp's active threads to fill empty lanes in combined mask
+        for (unsigned lane = 0; lane < MAX_WARP_SIZE && combined_count < MAX_WARP_SIZE; lane++) {
+          if (!combined_mask.test(lane) && other_mask.test(lane)) {
+            combined_mask.set(lane);
+            combined_count++;
+          }
+        }
+      }
+    }
+
+    // Issue the instruction with the combined mask
+    if ((pI->op == LOAD_OP) || (pI->op == STORE_OP) ||
+        (pI->op == MEMORY_BARRIER_OP) ||
+        (pI->op == TENSOR_CORE_LOAD_OP) ||
+        (pI->op == TENSOR_CORE_STORE_OP)) {
+      if (m_mem_out->has_free(m_shader->m_config->sub_core_model, m_id)) {
+        m_shader->issue_warp(*m_mem_out, pI, combined_mask, warp_id, m_id);
+        issued_inst = true;
+        warp(warp_id).ibuffer_free();
+        warp(warp_id).ibuffer_step();
+      }
+    } else {
+      bool sp_pipe_avail =
+          (m_shader->m_config->gpgpu_num_sp_units > 0) &&
+          m_sp_out->has_free(m_shader->m_config->sub_core_model, m_id);
+      if (sp_pipe_avail) {
+        m_shader->issue_warp(*m_sp_out, pI, combined_mask, warp_id, m_id);
+        issued_inst = true;
+        warp(warp_id).ibuffer_free();
+        warp(warp_id).ibuffer_step();
+      }
+    }
+
+    if (issued_inst) break;
+  }
+
+  // Update statistics
+  if (!valid_inst)
+    m_stats->shader_cycle_distro[0]++;
+  else if (!ready_inst)
+    m_stats->shader_cycle_distro[1]++;
+  else if (!issued_inst)
+    m_stats->shader_cycle_distro[2]++;
+}
+*/
 
 swl_scheduler::swl_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
                              Scoreboard *scoreboard, simt_stack **simt,
