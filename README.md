@@ -28,6 +28,18 @@ lrr (baseline)       9.9197
 two_level_rr         9.9520
 
 This accounts to a speedup of 1.000326 with two_level_rr over lrr. 
+
+
+
+
+Update after adding LWM:
+
+To run the benchmarks the following commands were run after invoking docker:
+cd /accel-sim/gpu-simulator/gpgpu-sim && make -j$(nproc) 2>&1 | grep error
+  cd /accel-sim/gpu-simulator && make -j$(nproc) 2>&1 | grep error
+  cd /accel-sim/gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM7_QV100
+  bash /accel-sim/run_all.sh
+
 1.000326
 
 
