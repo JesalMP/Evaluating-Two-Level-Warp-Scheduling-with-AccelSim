@@ -1,3 +1,4 @@
 [submodule "accel-sim-framework"]
 	path = accel-sim-framework
-	url = git@github.com:accel-sim/accel-sim-framework.git
+	url = git@github.com:JesalMP/accel-sim-framework.git
+	branch = dev
