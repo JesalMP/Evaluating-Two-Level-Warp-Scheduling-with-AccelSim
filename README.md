@@ -1,5 +1,5 @@
 # Evaluating-Two-Level-Warp-Scheduling-with-AccelSim
-(Analysis by LLMs)
+
 # Warp Scheduler Comparison: Default (LRR) vs Two-Level Round-Robin (2LRR)
 
 **Platform:** QV100-SASS (Volta V100)  
